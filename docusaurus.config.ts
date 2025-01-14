@@ -85,6 +85,11 @@ const config: Config = {
           label: 'Notes',
         },
         {
+          to: '/disclaimer',
+          label: 'Disclaimer',
+          position: 'right',
+        },
+        {
           href: 'https://github.com/tusharag6/codebook',
           label: 'GitHub',
           position: 'right',
