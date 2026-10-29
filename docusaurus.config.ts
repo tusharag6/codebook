@@ -57,6 +57,7 @@ const config: Config = {
       {
         docs: {
           sidebarPath: './sidebars.ts',
+          exclude: ['**/_*.{js,jsx,ts,tsx,md,mdx}', '**/raw-notes.md'],
           // Please change this to your repo.
           // Remove this to remove the "edit this page" links.
           editUrl:
