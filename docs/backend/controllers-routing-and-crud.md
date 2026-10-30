@@ -181,30 +181,48 @@ Before writing complex controllers, write down the business logic steps in comme
 
 ---
 
-## 4. Complete Production Implementation: User Registration
+## 4. Complete Production Implementation: User Management Suite
 
-### Step 1: Controller Implementation
+Here is the complete production implementation of `src/controllers/user.controller.js` covering authentication, session handling, account updates, and asset uploads.
 
 ```javascript
 // src/controllers/user.controller.js
 import { asyncHandler } from "../utils/asyncHandler.js";
 import { ApiError } from "../utils/ApiError.js";
+import { ApiResponse } from "../utils/ApiResponse.js";
 import { User } from "../models/user.model.js";
 import { uploadOnCloudinary } from "../utils/cloudinary.js";
-import { ApiResponse } from "../utils/ApiResponse.js";
+import jwt from "jsonwebtoken";
 
+// Helper: Generate token pair and persist refresh token to database
+const generateAccessAndRefreshTokens = async (userId) => {
+  try {
+    const user = await User.findById(userId);
+    const accessToken = user.generateAccessToken();
+    const refreshToken = user.generateRefreshToken();
+
+    user.refreshToken = refreshToken;
+    await user.save({ validateBeforeSave: false });
+
+    return { accessToken, refreshToken };
+  } catch (error) {
+    throw new ApiError(
+      500,
+      "Something went wrong while generating access and refresh tokens"
+    );
+  }
+};
+
+// 1. User Registration
 const registerUser = asyncHandler(async (req, res) => {
-  // 1. Extract details from request body
   const { fullName, email, userName, password } = req.body;
 
-  // 2. Validation: Ensure no required field is missing or empty whitespace
   if (
     [fullName, email, userName, password].some((field) => field?.trim() === "")
   ) {
     throw new ApiError(400, "All fields (fullName, email, userName, password) are required");
   }
 
-  // 3. Check for existing user with same email or username
   const existingUser = await User.findOne({
     $or: [{ userName: userName.toLowerCase() }, { email: email.toLowerCase() }],
   });
@@ -213,16 +231,20 @@ const registerUser = asyncHandler(async (req, res) => {
     throw new ApiError(409, "User with this email or username already exists");
   }
 
-  // 4. Extract uploaded file paths from Multer's req.files object
   const avatarLocalPath = req.files?.avatar?.[0]?.path;
-  const coverImageLocalPath = req.files?.coverImage?.[0]?.path;
+  let coverImageLocalPath;
+  if (
+    req.files &&
+    Array.isArray(req.files.coverImage) &&
+    req.files.coverImage.length > 0
+  ) {
+    coverImageLocalPath = req.files.coverImage[0].path;
+  }
 
-  // 5. Validate avatar requirement
   if (!avatarLocalPath) {
     throw new ApiError(400, "Avatar file is required");
   }
 
-  // 6. Upload files to Cloudinary
   const avatar = await uploadOnCloudinary(avatarLocalPath);
   const coverImage = coverImageLocalPath
     ? await uploadOnCloudinary(coverImageLocalPath)
@@ -232,8 +254,6 @@ const registerUser = asyncHandler(async (req, res) => {
     throw new ApiError(500, "Failed to upload avatar to cloud storage");
   }
 
-  // 7. Create user document in MongoDB
-  // Password will be hashed automatically by the userSchema pre("save") hook
   const user = await User.create({
     fullName,
     avatar: avatar.url,
@@ -243,7 +263,6 @@ const registerUser = asyncHandler(async (req, res) => {
     userName: userName.toLowerCase(),
   });
 
-  // 8. Fetch the newly created user excluding sensitive credentials
   const createdUser = await User.findById(user._id).select(
     "-password -refreshToken"
   );
@@ -252,26 +271,286 @@ const registerUser = asyncHandler(async (req, res) => {
     throw new ApiError(500, "Something went wrong while registering user");
   }
 
-  // 9. Return standardized success response
   return res
     .status(201)
     .json(new ApiResponse(201, createdUser, "User registered successfully"));
 });
 
-export { registerUser };
+// 2. User Login
+const loginUser = asyncHandler(async (req, res) => {
+  const { email, userName, password } = req.body;
+
+  if (!(userName || email)) {
+    throw new ApiError(400, "Username or email is required");
+  }
+
+  const user = await User.findOne({
+    $or: [
+      { userName: userName?.toLowerCase() },
+      { email: email?.toLowerCase() },
+    ],
+  });
+
+  if (!user) {
+    throw new ApiError(404, "User does not exist");
+  }
+
+  const isPasswordValid = await user.isPasswordCorrect(password);
+
+  if (!isPasswordValid) {
+    throw new ApiError(401, "Invalid user credentials");
+  }
+
+  const { accessToken, refreshToken } = await generateAccessAndRefreshTokens(user._id);
+
+  const loggedInUser = await User.findById(user._id).select(
+    "-password -refreshToken"
+  );
+
+  const options = {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+  };
+
+  return res
+    .status(200)
+    .cookie("accessToken", accessToken, options)
+    .cookie("refreshToken", refreshToken, options)
+    .json(
+      new ApiResponse(
+        200,
+        { user: loggedInUser, accessToken, refreshToken },
+        "User logged in successfully"
+      )
+    );
+});
+
+// 3. User Logout (Revoke tokens)
+const logoutUser = asyncHandler(async (req, res) => {
+  // Clear refresh token in database to prevent reuse
+  await User.findByIdAndUpdate(
+    req.user._id,
+    {
+      $set: {
+        refreshToken: undefined,
+      },
+    },
+    { new: true }
+  );
+
+  const options = {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+  };
+
+  return res
+    .status(200)
+    .clearCookie("accessToken", options)
+    .clearCookie("refreshToken", options)
+    .json(new ApiResponse(200, {}, "User logged out successfully"));
+});
+
+// 4. Refresh Access Token (Token rotation)
+const refreshAccessToken = asyncHandler(async (req, res) => {
+  const incomingRefreshToken =
+    req.cookies.refreshToken || req.body.refreshToken;
+
+  if (!incomingRefreshToken) {
+    throw new ApiError(401, "Unauthorized request: Missing refresh token");
+  }
+
+  try {
+    const decodedToken = jwt.verify(
+      incomingRefreshToken,
+      process.env.REFRESH_TOKEN_SECRET
+    );
+
+    const user = await User.findById(decodedToken._id);
+
+    if (!user) {
+      throw new ApiError(401, "Invalid refresh token");
+    }
+
+    if (incomingRefreshToken !== user?.refreshToken) {
+      throw new ApiError(401, "Refresh token is expired or already used");
+    }
+
+    const options = {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+    };
+
+    const { accessToken, refreshToken: newRefreshToken } =
+      await generateAccessAndRefreshTokens(user._id);
+
+    return res
+      .status(200)
+      .cookie("accessToken", accessToken, options)
+      .cookie("refreshToken", newRefreshToken, options)
+      .json(
+        new ApiResponse(
+          200,
+          { accessToken, refreshToken: newRefreshToken },
+          "Access token refreshed successfully"
+        )
+      );
+  } catch (error) {
+    throw new ApiError(401, error?.message || "Invalid refresh token");
+  }
+});
+
+// 5. Change Current Password
+const changeCurrentPassword = asyncHandler(async (req, res) => {
+  const { oldPassword, newPassword } = req.body;
+
+  // Use req.user._id from verifyJWT middleware for authenticated safety
+  const user = await User.findById(req.user?._id);
+
+  const isPasswordCorrect = await user.isPasswordCorrect(oldPassword);
+
+  if (!isPasswordCorrect) {
+    throw new ApiError(400, "Invalid old password");
+  }
+
+  user.password = newPassword;
+  await user.save({ validateBeforeSave: false }); // Triggers pre-save hook to hash password
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, {}, "Password changed successfully"));
+});
+
+// 6. Get Current User Profile
+const getCurrentUser = asyncHandler(async (req, res) => {
+  return res
+    .status(200)
+    .json(new ApiResponse(200, req.user, "Current user fetched successfully"));
+});
+
+// 7. Update Text Details (Name, Email)
+const updateAccountDetails = asyncHandler(async (req, res) => {
+  const { email, fullName } = req.body;
+
+  if (!fullName || !email) {
+    throw new ApiError(400, "FullName and email are required");
+  }
+
+  const user = await User.findByIdAndUpdate(
+    req.user?._id,
+    {
+      $set: {
+        fullName,
+        email: email.toLowerCase(),
+      },
+    },
+    { new: true }
+  ).select("-password -refreshToken");
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, user, "Account details updated successfully"));
+});
+
+// 8. Update User Avatar
+const updateUserAvatar = asyncHandler(async (req, res) => {
+  const avatarLocalPath = req.file?.path;
+
+  if (!avatarLocalPath) {
+    throw new ApiError(400, "Avatar file is missing");
+  }
+
+  const avatar = await uploadOnCloudinary(avatarLocalPath);
+
+  if (!avatar.url) {
+    throw new ApiError(500, "Error while uploading avatar to cloud storage");
+  }
+
+  const user = await User.findByIdAndUpdate(
+    req.user?._id,
+    {
+      $set: {
+        avatar: avatar.url,
+      },
+    },
+    { new: true }
+  ).select("-password -refreshToken");
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, user, "Avatar image updated successfully"));
+});
+
+// 9. Update User Cover Image
+const updateUserCoverImage = asyncHandler(async (req, res) => {
+  const coverImageLocalPath = req.file?.path;
+
+  if (!coverImageLocalPath) {
+    throw new ApiError(400, "Cover image file is missing");
+  }
+
+  const coverImage = await uploadOnCloudinary(coverImageLocalPath);
+
+  if (!coverImage?.url) {
+    throw new ApiError(500, "Error while uploading cover image to cloud storage");
+  }
+
+  const user = await User.findByIdAndUpdate(
+    req.user?._id,
+    {
+      $set: {
+        coverImage: coverImage.url,
+      },
+    },
+    { new: true }
+  ).select("-password -refreshToken");
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, user, "Cover image updated successfully"));
+});
+
+export {
+  registerUser,
+  loginUser,
+  logoutUser,
+  refreshAccessToken,
+  changeCurrentPassword,
+  getCurrentUser,
+  updateAccountDetails,
+  updateUserAvatar,
+  updateUserCoverImage,
+};
 ```
 
-### Step 2: Route Declaration with Multer Middleware
+---
+
+## 5. Master User Router: Public vs Protected Endpoints
 
 ```javascript
 // src/routes/user.routes.js
 import { Router } from "express";
-import { registerUser } from "../controllers/user.controller.js";
+import {
+  registerUser,
+  loginUser,
+  logoutUser,
+  refreshAccessToken,
+  changeCurrentPassword,
+  getCurrentUser,
+  updateAccountDetails,
+  updateUserAvatar,
+  updateUserCoverImage,
+} from "../controllers/user.controller.js";
+import { getUserChannelProfile, getWatchHistory } from "../controllers/user.controller.js";
 import { upload } from "../middlewares/multer.middleware.js";
+import { verifyJWT } from "../middlewares/auth.middleware.js";
 
 const router = Router();
 
-// Route: POST /api/v1/users/register
+// ==========================================
+// PUBLIC ROUTES
+// ==========================================
+
+// Register route: accepts multipart form data with multiple named file fields
 router.route("/register").post(
   upload.fields([
     { name: "avatar", maxCount: 1 },
@@ -280,27 +559,70 @@ router.route("/register").post(
   registerUser
 );
 
+// Login route
+router.route("/login").post(loginUser);
+
+// Refresh Token route: can be called with cookie or body token without verifyJWT
+router.route("/refresh-token").post(refreshAccessToken);
+
+// ==========================================
+// SECURED ROUTES (Protected by verifyJWT)
+// ==========================================
+
+router.route("/logout").post(verifyJWT, logoutUser);
+router.route("/change-password").post(verifyJWT, changeCurrentPassword);
+router.route("/current-user").get(verifyJWT, getCurrentUser);
+
+// Profile text updates use PATCH (partial document modification)
+router.route("/update-account").patch(verifyJWT, updateAccountDetails);
+
+// Single file upload endpoints use upload.single("fieldName")
+router
+  .route("/update-avatar")
+  .patch(verifyJWT, upload.single("avatar"), updateUserAvatar);
+
+router
+  .route("/update-coverimage")
+  .patch(verifyJWT, upload.single("coverImage"), updateUserCoverImage);
+
+// Aggregation-powered channel profile and watch history
+router.route("/c/:userName").get(verifyJWT, getUserChannelProfile);
+router.route("/history").get(verifyJWT, getWatchHistory);
+
 export default router;
-```
-
-### Step 3: Mounting in `app.js`
-
-```javascript
-// src/app.js
-import express from "express";
-import userRouter from "./routes/user.routes.js";
-
-const app = express();
-
-// Mount user routes under versioned API prefix
-app.use("/api/v1/users", userRouter);
-
-export default app;
 ```
 
 ---
 
-## 5. What Data Looks Like at Runtime
+## 6. HTTP Verb Conventions & Multer Placement
+
+### Why Use `PATCH` Instead of `POST` or `PUT` for Account Updates?
+- **`POST`**: Used for **creating** a brand new resource (e.g. creating a user at `/register`).
+- **`PUT`**: Replaces the **entire** resource. If you send `{ fullName: "John" }` via `PUT`, standard semantics imply all unmentioned fields (email, avatar) will be overwritten or erased.
+- **`PATCH`**: Applies **partial modifications** to an existing resource. Updating just an avatar image, a password, or a name is the exact definition of a `PATCH` operation.
+
+### Multer Middleware Placement: `upload.fields` vs `upload.single`
+- **`upload.fields([{ name: 'avatar', maxCount: 1 }, ...])`**:
+  - Used when an endpoint receives multiple files under **different field names**.
+  - Multer populates `req.files` as an object of arrays: `{ avatar: [file], coverImage: [file] }`.
+- **`upload.single('avatar')`**:
+  - Used when an endpoint receives a **single file** under one specific field name.
+  - Multer populates `req.file` as a single object: `{ fieldname: 'avatar', path: '...' }`.
+
+---
+
+## 7. Critical Bug Audits & Common Production Pitfalls
+
+| # | Pitfall Observed in Raw Notes | Production Fix & Rationale |
+| :--- | :--- | :--- |
+| **1** | `.cookie(", refreshToken", ...)` | **Leading Comma Bug**: Accidentally typing a leading comma sets the HTTP cookie header key to `", refreshToken"`. The client browser then stores it with a space or comma, meaning `req.cookies.refreshToken` returns `undefined` on all subsequent refresh calls! Fixed to `.cookie("refreshToken", ...)`. |
+| **2** | `User.findById(req.body?._id)` in `changeCurrentPassword` | **ID Spoofing Vulnerability**: Never trust an `_id` supplied in `req.body` on authenticated endpoints. A malicious user could supply another user's ID to reset their password! Always use `req.user._id` verified by `verifyJWT`. |
+| **3** | `if (!coverImageLocalPath.url)` | **Type Error**: `coverImageLocalPath` is a local disk file path string (e.g. `"public/temp/img.png"`), not an object with a `.url` property. The correct check is `if (!coverImage?.url)` on the Cloudinary response object. |
+| **4** | Orphaned Files on Cloud Storage | **Cloud Storage Leak**: When updating an avatar or cover image, the old image remains on Cloudinary unless explicitly deleted. In production, store Cloudinary's `public_id` and call `cloudinary.uploader.destroy(oldPublicId)` prior to saving the new URL. |
+
+---
+
+## 8. What Data Looks Like at Runtime
 
 When testing this endpoint (e.g., using Postman or Bruno):
 

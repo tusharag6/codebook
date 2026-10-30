@@ -112,29 +112,93 @@ A **JWT (JSON Web Token)** is a compact, URL-safe means of representing claims t
 Why do production systems use two distinct tokens (**Access Token** and **Refresh Token**)?
 
 ```
-+--------------------------------------------------------------------------------+
-|                        Access Token vs Refresh Token                           |
-+--------------------------------------------------------------------------------+
-| Feature              | Access Token                 | Refresh Token            |
-+----------------------+------------------------------+--------------------------+
-| Purpose              | Authorize API requests       | Obtain new access tokens |
-| Lifespan             | Short (15 min - 2 hours)     | Long (7 - 30 days)       |
-| Database Storage     | Not stored in DB (Stateless) | Stored in User Document  |
-| Client Storage       | Memory or httpOnly Cookie    | Secure httpOnly Cookie   |
-| Verification Speed   | Instant (Cryptographic verification without DB hits)     |
-+--------------------------------------------------------------------------------+
++-----------------------------------------------------------------------------------------+
+|                              Access Token vs Refresh Token                              |
++-----------------------------------------------------------------------------------------+
+| Feature              | Access Token                    | Refresh Token                  |
++----------------------+---------------------------------+--------------------------------+
+| Primary Purpose      | Authorize individual API calls  | Generate new access tokens     |
+| Lifespan             | Short (15 min - 2 hours)        | Long (7 - 30 days)             |
+| Database Storage     | Not stored in DB (100% Stateless)| Stored in User Document        |
+| Client Storage       | Memory or Secure httpOnly Cookie| Secure httpOnly Cookie         |
+| Verification Speed   | Instant (Signature check only)  | Signature check + DB matching  |
+| Revocation Window    | Until expiry (15m window max)   | Instantaneous (delete from DB) |
++-----------------------------------------------------------------------------------------+
 ```
 
-### The Security Model:
-1. When a client makes an API request, it includes the short-lived **Access Token**. The backend verifies the cryptographic signature without querying the database.
-2. If an attacker intercepts an Access Token, the exposure window is tiny because the token expires rapidly.
-3. When the Access Token expires, the client calls `/api/v1/users/refresh-token` with the **Refresh Token**.
-4. The server validates the Refresh Token against the token stored in the database. If valid, a fresh Access Token is issued.
-5. If a security incident occurs, an administrator can instantly revoke access by deleting the `refreshToken` in the database.
+### The Security & Performance Rationale
+
+1. **Minimizing Database Workload (High Performance)**:
+   - If every single request required a database lookup to check session state, high-traffic systems would experience severe database bottlenecks.
+   - **Access tokens solve this**: The backend mathematically verifies the cryptographic HMAC signature using `process.env.ACCESS_TOKEN_SECRET`. No database query is needed!
+
+2. **Mitigating Token Theft (Attack Surface Reduction)**:
+   - If an attacker intercepts a stateless access token (e.g., via man-in-the-middle on an unencrypted network), the window of compromise is minimal because the token expires in 15 minutes.
+   - Because the access token dies quickly, an attacker cannot maintain permanent unauthorized access.
+
+3. **Immediate Revocation (The Kill Switch)**:
+   - Purely stateless tokens cannot be revoked before they expire.
+   - The **Refresh Token** solves this: It is stored in the user's MongoDB document. If an account is compromised, the user logs out, or an admin bans the account, the server sets `user.refreshToken = undefined`. The next time the client attempts to refresh its access token, the database check fails, immediately locking out the attacker.
 
 ---
 
-## 5. Implementing Token Generation on Schemas
+## 5. End-to-End Token Lifecycle & Flow
+
+The following diagram illustrates the complete round-trip lifecycle of access and refresh tokens:
+
+```
++────────+                    +────────────────+                   +────────────────+
+| Client |                    | Express Server |                   | MongoDB Atlas  |
++────────+                    +────────────────+                   +────────────────+
+    │                                  │                                    │
+    │ 1. POST /login (credentials)     │                                    │
+    │─────────────────────────────────>│                                    │
+    │                                  │ 2. Find user & verify password     │
+    │                                  │───────────────────────────────────>│
+    │                                  │<───────────────────────────────────│
+    │                                  │                                    │
+    │                                  │ 3. Generate Access + Refresh Token │
+    │                                  │ 4. Save Refresh Token to User doc  │
+    │                                  │───────────────────────────────────>│
+    │                                  │<───────────────────────────────────│
+    │ 5. Set httpOnly Cookies          │                                    │
+    │<─────────────────────────────────│                                    │
+    │                                  │                                    │
+    │ 6. GET /api/v1/users/current-user│                                    │
+    │    (Cookie: accessToken)         │                                    │
+    │─────────────────────────────────>│                                    │
+    │                                  │ 7. verifyJWT checks signature      │
+    │ 8. HTTP 200 (Protected Data)    │    (No DB hit required!)           │
+    │<─────────────────────────────────│                                    │
+    │                                  │                                    │
+    │        ... 15 minutes later: Access Token Expires ...                 │
+    │                                  │                                    │
+    │ 9. GET /api/v1/users/current-user│                                    │
+    │─────────────────────────────────>│                                    │
+    │ 10. HTTP 401 Unauthorized        │                                    │
+    │<─────────────────────────────────│                                    │
+    │                                  │                                    │
+    │ 11. POST /refresh-token          │                                    │
+    │     (Cookie: refreshToken)       │                                    │
+    │─────────────────────────────────>│ 12. Verify signature & match      │
+    │                                  │     token against DB document      │
+    │                                  │───────────────────────────────────>│
+    │                                  │<───────────────────────────────────│
+    │                                  │ 13. Generate new token pair        │
+    │                                  │     (Refresh Token Rotation)       │
+    │ 14. Return new httpOnly cookies  │                                    │
+    │<─────────────────────────────────│                                    │
+    │                                  │                                    │
+    │ 15. POST /logout                 │                                    │
+    │─────────────────────────────────>│ 16. user.refreshToken = undefined  │
+    │                                  │───────────────────────────────────>│
+    │ 17. res.clearCookie(...)         │<───────────────────────────────────│
+    │<─────────────────────────────────│                                    │
+```
+
+---
+
+## 6. Implementing Schema Generator Methods
 
 Add custom generator methods directly to your Mongoose schema:
 
@@ -156,7 +220,7 @@ userSchema.methods.generateAccessToken = function () {
   );
 };
 
-// Method to generate long-lived Refresh Token
+// Method to generate long-lived Refresh Token (minimal payload)
 userSchema.methods.generateRefreshToken = function () {
   return jwt.sign(
     {
@@ -174,7 +238,193 @@ export const User = mongoose.model("User", userSchema);
 
 ---
 
-## 6. Secure Cookie Attributes
+## 7. Token Generation Helper: `generateAccessAndRefreshTokens`
+
+To keep controller logic clean and DRY (Don't Repeat Yourself), extract token creation and database synchronization into a reusable helper function:
+
+```javascript
+// src/controllers/user.controller.js
+const generateAccessAndRefreshTokens = async (userId) => {
+  try {
+    const user = await User.findById(userId);
+    const accessToken = user.generateAccessToken();
+    const refreshToken = user.generateRefreshToken();
+
+    // Persist the refresh token in the database for validation & revocation
+    user.refreshToken = refreshToken;
+
+    // validateBeforeSave: false bypasses schema validations (e.g. required avatar/password)
+    // while updating only the refreshToken field
+    await user.save({ validateBeforeSave: false });
+
+    return { accessToken, refreshToken };
+  } catch (error) {
+    throw new ApiError(
+      500,
+      "Something went wrong while generating access and refresh tokens"
+    );
+  }
+};
+```
+
+> [!NOTE]
+> **Why `validateBeforeSave: false`?**
+> When calling `user.save()`, Mongoose re-runs all schema validation rules by default. Because we only loaded the user to update `refreshToken` without supplying other fields or triggering pre-save hooks on already-hashed passwords, `{ validateBeforeSave: false }` ensures the operation succeeds efficiently.
+
+---
+
+## 8. The `verifyJWT` Authentication Middleware
+
+Protected endpoints require a middleware that intercepts incoming requests, extracts the JWT, verifies its cryptographic authenticity, and attaches the authenticated user record to `req.user`.
+
+```javascript
+// src/middlewares/auth.middleware.js
+import jwt from "jsonwebtoken";
+import { User } from "../models/user.model.js";
+import { ApiError } from "../utils/ApiError.js";
+import { asyncHandler } from "../utils/asyncHandler.js";
+
+export const verifyJWT = asyncHandler(async (req, res, next) => {
+  try {
+    // 1. Extract token from either httpOnly cookies or Authorization header
+    const token =
+      req.cookies?.accessToken ||
+      req.header("Authorization")?.replace("Bearer ", "");
+
+    if (!token) {
+      throw new ApiError(401, "Unauthorized request: No access token provided");
+    }
+
+    // 2. Mathematically verify the signature using secret key
+    const decodedToken = jwt.verify(token, process.env.ACCESS_TOKEN_SECRET);
+
+    // 3. Retrieve user from database (omit sensitive credentials)
+    const user = await User.findById(decodedToken?._id).select(
+      "-password -refreshToken"
+    );
+
+    if (!user) {
+      throw new ApiError(401, "Invalid access token: User no longer exists");
+    }
+
+    // 4. Attach user document to Express request object
+    req.user = user;
+    next();
+  } catch (error) {
+    throw new ApiError(401, error?.message || "Invalid access token");
+  }
+});
+```
+
+### Key Architectural Strengths:
+- **Dual Retrieval Support**: Reads tokens from both `req.cookies` (for browser-based web applications) and `req.header("Authorization")` (for mobile apps and external API consumers).
+- **Safe Object Injection**: Never attaches raw passwords or refresh tokens to `req.user` (`.select("-password -refreshToken")`).
+
+---
+
+## 9. Refresh Token Rotation (`refreshAccessToken`)
+
+When an access token expires, the client calls the refresh endpoint without requiring the user to re-enter their username and password:
+
+```javascript
+// src/controllers/user.controller.js
+export const refreshAccessToken = asyncHandler(async (req, res) => {
+  const incomingRefreshToken =
+    req.cookies.refreshToken || req.body.refreshToken;
+
+  if (!incomingRefreshToken) {
+    throw new ApiError(401, "Unauthorized request: Refresh token is missing");
+  }
+
+  try {
+    // 1. Verify cryptographic validity of incoming refresh token
+    const decodedToken = jwt.verify(
+      incomingRefreshToken,
+      process.env.REFRESH_TOKEN_SECRET
+    );
+
+    // 2. Find user in MongoDB
+    const user = await User.findById(decodedToken?._id);
+
+    if (!user) {
+      throw new ApiError(401, "Invalid refresh token");
+    }
+
+    // 3. Security Check: Compare incoming token against the token saved in DB
+    if (incomingRefreshToken !== user?.refreshToken) {
+      throw new ApiError(401, "Refresh token is expired or has already been used");
+    }
+
+    const options = {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+    };
+
+    // 4. Token Rotation: Issue a fresh Access Token AND a fresh Refresh Token
+    const { accessToken, refreshToken: newRefreshToken } =
+      await generateAccessAndRefreshTokens(user._id);
+
+    return res
+      .status(200)
+      .cookie("accessToken", accessToken, options)
+      .cookie("refreshToken", newRefreshToken, options)
+      .json(
+        new ApiResponse(
+          200,
+          { accessToken, refreshToken: newRefreshToken },
+          "Access token refreshed successfully"
+        )
+      );
+  } catch (error) {
+    throw new ApiError(401, error?.message || "Invalid refresh token");
+  }
+});
+```
+
+> [!IMPORTANT]
+> **What is Refresh Token Rotation?**
+> Notice that `generateAccessAndRefreshTokens` issues **both** a new access token and a **new refresh token**, invalidating the old refresh token in the database. If a malicious entity intercepts an old refresh token and attempts to use it, the database comparison `incomingRefreshToken !== user?.refreshToken` fails immediately.
+
+---
+
+## 10. Safe Password Modification: Why `findByIdAndUpdate` Fails
+
+A critical pitfall in password management is using `User.findByIdAndUpdate(userId, { password: newPassword })`.
+
+> [!CAUTION]
+> **Bypassing Mongoose Lifecycle Hooks**:
+> `findByIdAndUpdate` is executed directly as a native MongoDB driver command. **It does NOT trigger `pre("save")` hooks!** If you use `findByIdAndUpdate` to update a password, it will be stored in your database as **unencrypted plain text**!
+
+### The Correct Implementation:
+```javascript
+export const changeCurrentPassword = asyncHandler(async (req, res) => {
+  const { oldPassword, newPassword } = req.body;
+
+  // req.user._id is safely supplied by verifyJWT middleware
+  const user = await User.findById(req.user?._id);
+
+  // 1. Verify old password using our custom instance method
+  const isPasswordCorrect = await user.isPasswordCorrect(oldPassword);
+
+  if (!isPasswordCorrect) {
+    throw new ApiError(400, "Invalid old password");
+  }
+
+  // 2. Assign new plain-text password to document property
+  user.password = newPassword;
+
+  // 3. Save document - THIS TRIGGERS the pre("save") hook which hashes user.password!
+  await user.save({ validateBeforeSave: false });
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, {}, "Password changed successfully"));
+});
+```
+
+---
+
+## 11. Secure Cookie Attributes
 
 When returning tokens to the client in HTTP responses, always configure secure cookie options:
 

@@ -928,4 +928,692 @@ cloudinary response
 req.body
 req.files
 
-how is password hashed automatically and refresh token added
+how is password hashed automatically and refresh token added:
+- In `user.model.js`, a Mongoose `pre("save")` hook listens for save events.
+- Before saving, it checks `if (!this.isModified("password")) return next();`. If modified or new, it hashes the password with `bcrypt.hash(this.password, 10)`.
+- When generating refresh tokens, `user.refreshToken = refreshToken; await user.save({ validateBeforeSave: false });` attaches the new refresh token without re-running validators or modifying other fields.
+
+---
+
+---
+
+## How Access Token and Refresh Token Work & What They Are
+
+### 1. What are they?
+- **Access Token**: A short-lived, digitally signed JSON Web Token (JWT) used to authorize access to protected API endpoints. It is completely **stateless** — the backend verifies it solely via its cryptographic signature (`process.env.ACCESS_TOKEN_SECRET`) without querying the database on every request.
+- **Refresh Token**: A long-lived token (e.g. 10 to 30 days) stored both in the client (in an `httpOnly`, `secure` cookie) and in the **MongoDB User document** (`user.refreshToken`). It is used exclusively to obtain a brand new Access Token when the old one expires, without forcing the user to log in again.
+
+### 2. Why use a dual-token strategy instead of one single token?
+- **Security vs Convenience**: If an Access Token is intercepted by an attacker, the breach window is minimal (expires in 15–30 minutes).
+- **Instant Revocation**: Purely stateless tokens cannot be invalidated before they expire. By keeping the Refresh Token in the database, logging out or banning an account clears the DB token (`user.refreshToken = undefined`), instantly blocking further token refreshes.
+- **High Database Performance**: 99% of user requests only check the Access Token cryptographically in CPU memory — zero DB queries needed for auth on every API call.
+
+### 3. Step-by-Step Flow:
+1. **Login**: User submits credentials. Server validates password with bcrypt.
+2. **Issue**: Server creates both tokens via `generateAccessAndRefreshTokens`. Saves `refreshToken` to DB (`user.refreshToken = refreshToken`).
+3. **Transport**: Server sends tokens to client inside `httpOnly` secure cookies.
+4. **API Requests**: Client sends `accessToken` on each request. The `verifyJWT` middleware checks the signature and sets `req.user`.
+5. **Expiration & Refresh**: When `accessToken` expires (401), client calls `/refresh-token`. Server verifies the `refreshToken`, confirms it matches `user.refreshToken` in the DB, and generates a fresh pair (Refresh Token Rotation).
+6. **Logout**: Server deletes `refreshToken` from the user's DB document and clears both cookies from the browser.
+
+---
+
+## User Controller Code (Production Walkthrough & Bug Fixes)
+
+```javascript
+import { asyncHandler } from "../utils/asyncHandler.js";
+import { ApiError } from "../utils/ApiError.js";
+import { User } from "../models/user.model.js";
+import { uploadOnCloudinary } from "../utils/cloudinary.js";
+import { ApiResponse } from "../utils/ApiResponse.js";
+import jwt from "jsonwebtoken";
+
+// Helper method to generate both tokens and persist refresh token to DB
+const generateAccessAndRefreshTokens = async (userId) => {
+  try {
+    const user = await User.findById(userId);
+    const accessToken = user.generateAccessToken();
+    const refreshToken = user.generateRefreshToken();
+
+    user.refreshToken = refreshToken;
+
+    // validateBeforeSave: false ensures schema validation rules aren't re-run
+    await user.save({ validateBeforeSave: false });
+
+    return { accessToken, refreshToken };
+  } catch (error) {
+    throw new ApiError(
+      500,
+      "Something went wrong while generating access and refresh token",
+    );
+  }
+};
+
+const registerUser = asyncHandler(async (req, res) => {
+  const { fullName, email, userName, password } = req.body;
+
+  if (
+    [fullName, email, userName, password].some((field) => field?.trim() === "")
+  ) {
+    throw new ApiError(400, "All fields are required");
+  }
+
+  const existedUser = await User.findOne({
+    $or: [{ userName: userName.toLowerCase() }, { email: email.toLowerCase() }],
+  });
+
+  if (existedUser) {
+    throw new ApiError(409, "User with email or username already exists");
+  }
+
+  const avatarLocalPath = req.files?.avatar?.[0]?.path;
+  let coverImageLocalPath;
+
+  if (
+    req.files &&
+    Array.isArray(req.files.coverImage) &&
+    req.files.coverImage.length > 0
+  ) {
+    coverImageLocalPath = req.files.coverImage[0].path;
+  }
+
+  if (!avatarLocalPath) {
+    throw new ApiError(400, "Avatar file is required");
+  }
+
+  const avatar = await uploadOnCloudinary(avatarLocalPath);
+  const coverImage = coverImageLocalPath
+    ? await uploadOnCloudinary(coverImageLocalPath)
+    : null;
+
+  if (!avatar) {
+    throw new ApiError(400, "Failed to upload avatar to cloud storage");
+  }
+
+  const user = await User.create({
+    fullName,
+    avatar: avatar.url,
+    coverImage: coverImage?.url || "",
+    email: email.toLowerCase(),
+    password,
+    userName: userName.toLowerCase(),
+  });
+
+  const createdUser = await User.findById(user._id).select(
+    "-password -refreshToken",
+  );
+
+  if (!createdUser) {
+    throw new ApiError(500, "Something went wrong while registering the user");
+  }
+
+  return res
+    .status(201)
+    .json(new ApiResponse(201, createdUser, "User registered successfully"));
+});
+
+const loginUser = asyncHandler(async (req, res) => {
+  const { email, userName, password } = req.body;
+
+  if (!(userName || email)) {
+    throw new ApiError(400, "Username or email is required");
+  }
+
+  const user = await User.findOne({
+    $or: [
+      { userName: userName?.toLowerCase() },
+      { email: email?.toLowerCase() },
+    ],
+  });
+
+  if (!user) {
+    throw new ApiError(404, "User does not exist");
+  }
+
+  const isPasswordValid = await user.isPasswordCorrect(password);
+
+  if (!isPasswordValid) {
+    throw new ApiError(401, "Invalid user credentials");
+  }
+
+  const { accessToken, refreshToken } = await generateAccessAndRefreshTokens(
+    user._id,
+  );
+
+  const loggedInUser = await User.findById(user._id).select(
+    "-password -refreshToken",
+  );
+
+  const options = {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+  };
+
+  // NOTE: In raw notes, there was a typo: .cookie(", refreshToken", ...)
+  // Fixed below to .cookie("refreshToken", ...)
+  return res
+    .status(200)
+    .cookie("accessToken", accessToken, options)
+    .cookie("refreshToken", refreshToken, options)
+    .json(
+      new ApiResponse(
+        200,
+        {
+          user: loggedInUser,
+          accessToken,
+          refreshToken,
+        },
+        "User logged in successfully",
+      ),
+    );
+});
+
+const logoutUser = asyncHandler(async (req, res) => {
+  // Invalidate refresh token in database
+  await User.findByIdAndUpdate(
+    req.user._id,
+    {
+      $set: {
+        refreshToken: undefined,
+      },
+    },
+    {
+      new: true,
+    },
+  );
+
+  const options = {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+  };
+
+  return res
+    .status(200)
+    .clearCookie("accessToken", options)
+    .clearCookie("refreshToken", options)
+    .json(new ApiResponse(200, {}, "User logged out"));
+});
+
+const refreshAccessToken = asyncHandler(async (req, res) => {
+  const incomingRefreshToken =
+    req.cookies.refreshToken || req.body.refreshToken;
+
+  if (!incomingRefreshToken) {
+    throw new ApiError(401, "Unauthorized request: missing refresh token");
+  }
+
+  try {
+    const decodedToken = jwt.verify(
+      incomingRefreshToken,
+      process.env.REFRESH_TOKEN_SECRET,
+    );
+
+    const user = await User.findById(decodedToken._id);
+
+    if (!user) {
+      throw new ApiError(401, "Invalid refresh token");
+    }
+
+    if (incomingRefreshToken !== user?.refreshToken) {
+      throw new ApiError(401, "Refresh token is expired or used");
+    }
+
+    const options = {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+    };
+
+    // Refresh Token Rotation: issue fresh access and refresh token pair
+    const { accessToken, refreshToken: newRefreshToken } =
+      await generateAccessAndRefreshTokens(user._id);
+
+    return res
+      .status(200)
+      .cookie("accessToken", accessToken, options)
+      .cookie("refreshToken", newRefreshToken, options)
+      .json(
+        new ApiResponse(
+          200,
+          { accessToken, refreshToken: newRefreshToken },
+          "Access token refreshed",
+        ),
+      );
+  } catch (error) {
+    throw new ApiError(401, error?.message || "Invalid refresh token");
+  }
+});
+
+const changeCurrentPassword = asyncHandler(async (req, res) => {
+  const { oldPassword, newPassword } = req.body;
+
+  // IMPORTANT FIX: In raw notes, req.body?._id was used.
+  // In secured routes, always use req.user?._id populated by verifyJWT middleware!
+  const user = await User.findById(req.user?._id);
+
+  const isPasswordCorrect = await user.isPasswordCorrect(oldPassword);
+
+  if (!isPasswordCorrect) {
+    throw new ApiError(400, "Invalid old password");
+  }
+
+  user.password = newPassword;
+  // user.save() runs the pre("save") hook which hashes the new password
+  await user.save({ validateBeforeSave: false });
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, {}, "Password changed successfully"));
+});
+
+const getCurrentUser = asyncHandler(async (req, res) => {
+  return res
+    .status(200)
+    .json(new ApiResponse(200, req.user, "Current user fetched successfully"));
+});
+
+const updateAccountDetails = asyncHandler(async (req, res) => {
+  const { email, fullName } = req.body;
+
+  if (!fullName || !email) {
+    throw new ApiError(400, "FullName and email are required");
+  }
+
+  const user = await User.findByIdAndUpdate(
+    req.user?._id,
+    {
+      $set: {
+        fullName,
+        email: email.toLowerCase(),
+      },
+    },
+    { new: true },
+  ).select("-password -refreshToken");
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, user, "Account details updated successfully"));
+});
+
+const updateUserAvatar = asyncHandler(async (req, res) => {
+  const avatarLocalPath = req.file?.path;
+
+  if (!avatarLocalPath) {
+    throw new ApiError(400, "Avatar file is missing");
+  }
+
+  // Upload new image to Cloudinary
+  const avatar = await uploadOnCloudinary(avatarLocalPath);
+
+  if (!avatar.url) {
+    throw new ApiError(500, "Error while uploading avatar to cloud storage");
+  }
+
+  const user = await User.findByIdAndUpdate(
+    req.user?._id,
+    {
+      $set: {
+        avatar: avatar.url,
+      },
+    },
+    { new: true },
+  ).select("-password -refreshToken");
+
+  return res.status(200).json(new ApiResponse(200, user, "Avatar updated successfully"));
+});
+
+const updateUserCoverImage = asyncHandler(async (req, res) => {
+  const coverImageLocalPath = req.file?.path;
+
+  if (!coverImageLocalPath) {
+    throw new ApiError(400, "Cover image file is missing");
+  }
+
+  const coverImage = await uploadOnCloudinary(coverImageLocalPath);
+
+  // IMPORTANT FIX: In raw notes, coverImageLocalPath.url was checked instead of coverImage.url
+  if (!coverImage?.url) {
+    throw new ApiError(500, "Error while uploading cover image");
+  }
+
+  const user = await User.findByIdAndUpdate(
+    req.user?._id,
+    {
+      $set: {
+        coverImage: coverImage.url,
+      },
+    },
+    { new: true },
+  ).select("-password -refreshToken");
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, user, "Cover image updated successfully"));
+});
+
+export {
+  registerUser,
+  loginUser,
+  logoutUser,
+  refreshAccessToken,
+  changeCurrentPassword,
+  getCurrentUser,
+  updateAccountDetails,
+  updateUserAvatar,
+  updateUserCoverImage,
+};
+```
+
+---
+
+## Subscription Schema & Relational Modeling
+
+```javascript
+import mongoose, { Schema } from "mongoose";
+
+const subscriptionSchema = new Schema(
+  {
+    subscriber: {
+      type: Schema.Types.ObjectId, // The user subscribing
+      ref: "User",
+    },
+    channel: {
+      type: Schema.Types.ObjectId, // The user/creator being subscribed to
+      ref: "User",
+    },
+  },
+  { timestamps: true }
+);
+
+export const Subscription = mongoose.model("Subscription", subscriptionSchema);
+```
+
+### How the Subscription Schema Works:
+In a video-sharing platform, creators and subscribers are both stored in the `User` collection. A channel is simply a `User`.
+
+```
+               [ User A ]            [ Channel B ]            [ User C ]
+                   │                       ▲                      │
+                   │ (Subscribes to)       │                      │ (Subscribes to)
+                   └───────────────┐       │       ┌──────────────┘
+                                   ▼       │       ▼
+                          +──────────────────────────────────+
+                          | Subscription Junction Collection |
+                          +──────────────────────────────────+
+                          | Doc 1: { subscriber: A, channel: B } |
+                          | Doc 2: { subscriber: C, channel: B } |
+                          | Doc 3: { subscriber: B, channel: A } |
+                          +──────────────────────────────────+
+```
+
+1. **How many subscribers does a channel have?**
+   - Query: Count the number of documents in `Subscription` where `channel === channelId`.
+   - In the diagram above, Channel B appears twice as `channel` (Doc 1 and Doc 2) -> Channel B has **2 subscribers** (A and C).
+
+2. **How many channels has a user subscribed to?**
+   - Query: Count the number of documents in `Subscription` where `subscriber === userId`.
+   - In the diagram above, User B appears once as `subscriber` (Doc 3) -> User B is subscribed to **1 channel** (Channel A).
+
+---
+
+## MongoDB Aggregation Pipelines
+
+### What is an Aggregation Pipeline?
+An aggregation pipeline is an assembly line for processing and transforming data. Documents enter from a collection, pass through sequential stages (`$match`, `$lookup`, `$group`, etc.), and are transformed step-by-step into computed summary data.
+
+### Simple Example: Authors and Books
+
+Imagine two collections:
+- `authors`: `[{ _id: 1, name: "Orwell" }, { _id: 2, name: "Tolkien" }]`
+- `books`: `[{ title: "1984", author: 1, price: 10 }, { title: "Animal Farm", author: 1, price: 8 }, { title: "The Hobbit", author: 2, price: 15 }]`
+
+To get Orwell with all his books and total catalog price:
+```javascript
+Author.aggregate([
+  // 1. $match stage: Filter for Orwell
+  { $match: { name: "Orwell" } },
+  // 2. $lookup stage: Left outer join with books collection
+  {
+    $lookup: {
+      from: "books",
+      localField: "_id",
+      foreignField: "author",
+      as: "authoredBooks",
+    },
+  },
+  // 3. $addFields: Count total books and calculate sum
+  {
+    $addFields: {
+      bookCount: { $size: "$authoredBooks" },
+      totalValue: { $sum: "$authoredBooks.price" },
+    },
+  },
+  // 4. $project: Format the response
+  {
+    $project: {
+      name: 1,
+      bookCount: 1,
+      totalValue: 1,
+    },
+  },
+]);
+```
+
+### Most Commonly Used Stages:
+- `$match`: Filters documents (like SQL `WHERE`). Always place early to use indexes.
+- `$lookup`: Performs a left outer join to fetch documents from an external collection.
+- `$group`: Groups documents by a key and calculates accumulators (`$sum`, `$avg`, `$push`).
+- `$project`: Shapes which fields are included (`1`), excluded (`0`), or calculated.
+- `$addFields`: Adds computed properties without removing unmentioned fields.
+- `$unwind`: Deconstructs an array field, outputting a document for each element.
+- `$sort`, `$skip`, `$limit`: Reorders, skips, and limits output documents for pagination.
+
+---
+
+## Complex Aggregation Case Study 1: `getUserChannelProfile`
+
+```javascript
+const getUserChannelProfile = asyncHandler(async (req, res) => {
+  const { userName } = req.params;
+
+  if (!userName?.trim()) {
+    throw new ApiError(400, "Username is missing");
+  }
+
+  const channel = await User.aggregate([
+    // 1. Match the target channel/user by lowercase username
+    {
+      $match: {
+        userName: userName?.toLowerCase(),
+      },
+    },
+    // 2. Join all subscriptions where this user is the channel
+    {
+      $lookup: {
+        from: "subscriptions",
+        localField: "_id",
+        foreignField: "channel",
+        as: "subscribers",
+      },
+    },
+    // 3. Join all subscriptions where this user is the subscriber
+    {
+      $lookup: {
+        from: "subscriptions",
+        localField: "_id",
+        foreignField: "subscriber",
+        as: "subscribedTo",
+      },
+    },
+    // 4. Add computed count fields and isSubscribed boolean
+    {
+      $addFields: {
+        subscribersCount: {
+          $size: "$subscribers",
+        },
+        channelSubscribedToCount: {
+          // NOTE: Raw note typo fix: must use "$subscribedTo" with $ prefix
+          $size: "$subscribedTo",
+        },
+        isSubscribed: {
+          $cond: {
+            // Checks if req.user._id is inside "$subscribers.subscriber" array
+            if: { $in: [req.user?._id, "$subscribers.subscriber"] },
+            then: true,
+            else: false,
+          },
+        },
+      },
+    },
+    // 5. Select only necessary profile fields
+    {
+      $project: {
+        fullName: 1,
+        userName: 1,
+        subscribersCount: 1,
+        channelSubscribedToCount: 1,
+        isSubscribed: 1, // Fixed raw note syntax: isSubscribed: 1
+        avatar: 1,
+        coverImage: 1,
+        email: 1,
+      },
+    },
+  ]);
+
+  if (!channel?.length) {
+    throw new ApiError(404, "Channel does not exist");
+  }
+
+  return res
+    .status(200)
+    .json(
+      new ApiResponse(200, channel[0], "User channel fetched successfully"),
+    );
+});
+```
+
+---
+
+## Complex Aggregation Case Study 2: `getWatchHistory` with Nested Pipeline
+
+```javascript
+const getWatchHistory = asyncHandler(async (req, res) => {
+  const user = await User.aggregate([
+    // 1. Match the authenticated user by ObjectId
+    // NOTE: Must use new mongoose.Types.ObjectId() inside aggregation $match!
+    {
+      $match: {
+        _id: new mongoose.Types.ObjectId(req.user?._id),
+      },
+    },
+    // 2. Join watchHistory array with videos collection
+    {
+      $lookup: {
+        from: "videos",
+        localField: "watchHistory",
+        foreignField: "_id",
+        as: "watchHistory",
+        // Nested sub-pipeline executed on each video
+        pipeline: [
+          {
+            // Join video owner from users collection
+            $lookup: {
+              from: "users",
+              localField: "owner",
+              foreignField: "_id",
+              as: "owner",
+              pipeline: [
+                {
+                  $project: {
+                    fullName: 1,
+                    userName: 1,
+                    avatar: 1,
+                  },
+                },
+              ],
+            },
+          },
+          // $lookup returns an array; $first extracts the single owner object
+          {
+            $addFields: {
+              owner: {
+                $first: "$owner",
+              },
+            },
+          },
+        ],
+      },
+    },
+  ]);
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, user[0].watchHistory, "Watch History fetched successfully"));
+});
+```
+
+---
+
+## Complete User Routes
+
+```javascript
+import { Router } from "express";
+import {
+  changeCurrentPassword,
+  getCurrentUser,
+  getUserChannelProfile,
+  getWatchHistory,
+  loginUser,
+  logoutUser,
+  refreshAccessToken,
+  registerUser,
+  updateAccountDetails,
+  updateUserAvatar,
+  updateUserCoverImage,
+} from "../controllers/user.controller.js";
+import { upload } from "../middlewares/multer.middleware.js";
+import { verifyJWT } from "../middlewares/auth.middleware.js";
+
+const router = Router();
+
+// ==========================================
+// PUBLIC ROUTES
+// ==========================================
+router.route("/register").post(
+  upload.fields([
+    {
+      name: "avatar",
+      maxCount: 1,
+    },
+    {
+      name: "coverImage",
+      maxCount: 1,
+    },
+  ]),
+  registerUser,
+);
+
+router.route("/login").post(loginUser);
+router.route("/refresh-token").post(refreshAccessToken);
+
+// ==========================================
+// SECURED ROUTES (Require valid Access Token via verifyJWT)
+// ==========================================
+router.route("/logout").post(verifyJWT, logoutUser);
+router.route("/change-password").post(verifyJWT, changeCurrentPassword);
+router.route("/current-user").get(verifyJWT, getCurrentUser);
+
+// Partial profile updates use PATCH
+router.route("/update-account").patch(verifyJWT, updateAccountDetails);
+router
+  .route("/update-avatar")
+  .patch(verifyJWT, upload.single("avatar"), updateUserAvatar);
+router
+  .route("/update-coverimage")
+  .patch(verifyJWT, upload.single("coverImage"), updateUserCoverImage);
+
+// Aggregations
+router.route("/c/:userName").get(verifyJWT, getUserChannelProfile);
+router.route("/history").get(verifyJWT, getWatchHistory);
+
+export default router;
+```

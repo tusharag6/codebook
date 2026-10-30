@@ -193,3 +193,84 @@ Store related items directly inside an array of subdocuments.
 - **Patient**: `name`, `age`, `bloodGroup`, `gender`, `admittedIn` (ref to Hospital).
 - **Doctor**: `name`, `specialization`, `experienceInYears`, `worksInHospitals` (array of refs).
 - **MedicalRecord**: `patient` (ref), `diagnosedBy` (ref to Doctor), `symptoms`, `prescription`.
+
+---
+
+## 6. Advanced Relational Pattern: YouTube Subscription Modeling
+
+A common design challenge is modeling many-to-many relationships where **both sides of the relationship are the same entity** (self-referencing relationships). In a video platform, every user is a subscriber, and every user can also be a creator (channel).
+
+### The Subscription Schema
+
+```javascript
+// src/models/subscription.model.js
+import mongoose, { Schema } from "mongoose";
+
+const subscriptionSchema = new Schema(
+  {
+    subscriber: {
+      type: Schema.Types.ObjectId,
+      ref: "User", // The user who is subscribing
+      required: true,
+      index: true,
+    },
+    channel: {
+      type: Schema.Types.ObjectId,
+      ref: "User", // The user/channel being subscribed to
+      required: true,
+      index: true,
+    },
+  },
+  { timestamps: true }
+);
+
+// Enforce unique pair: a user cannot subscribe to the same channel twice
+subscriptionSchema.index({ subscriber: 1, channel: 1 }, { unique: true });
+
+export const Subscription = mongoose.model("Subscription", subscriptionSchema);
+```
+
+### Conceptual Architecture
+
+Instead of embedding arrays inside user documents, each subscription exists as a lightweight junction document:
+
+```
++─────────────────────────────────────────────────────────────────────────────+
+|                         Subscription Junction Model                         |
++─────────────────────────────────────────────────────────────────────────────+
+
+  Users:
+    User A ("Alex")       User B ("CodeChannel")       User C ("Chris")
+
+  Subscription Documents Created in DB:
+  ┌─────────────────────────────────────────────────────────────┐
+  │ Doc 1: { subscriber: Alex (A), channel: CodeChannel (B) }   │
+  │ Doc 2: { subscriber: Chris (C), channel: CodeChannel (B) }  │
+  │ Doc 3: { subscriber: CodeChannel (B), channel: Alex (A) }   │
+  └─────────────────────────────────────────────────────────────┘
+
+  1. "How many subscribers does CodeChannel (B) have?"
+     Query: Count documents where { channel: B }
+     Matches: Doc 1, Doc 2  ──> Result: 2 Subscribers
+
+  2. "How many channels has CodeChannel (B) subscribed to?"
+     Query: Count documents where { subscriber: B }
+     Matches: Doc 3         ──> Result: 1 Subscribed Channel
+```
+
+### Why NOT embed an array of subscribers in the `User` schema?
+
+```javascript
+// ANTI-PATTERN: DO NOT DO THIS FOR UNBOUNDED LISTS!
+const userSchema = new Schema({
+  username: String,
+  subscribers: [{ type: Schema.Types.ObjectId, ref: "User" }], // DANGEROUS!
+});
+```
+
+1. **MongoDB's 16MB BSON Document Limit**:
+   - Each `ObjectId` is 12 bytes. If a creator gains millions of subscribers, the array will exceed MongoDB's maximum document size (16 megabytes) and crash your application.
+2. **Write Performance & Document Relocation**:
+   - Continuously pushing elements to an embedded array causes document growth. When a document outgrows its allocated disk memory block, MongoDB must physically relocate it on disk, severely impacting write throughput.
+3. **Infinite Scalability with Junction Collections**:
+   - A dedicated `Subscription` collection can store hundreds of millions of individual subscription rows effortlessly, with indexed read/write performance.
